@@ -1,0 +1,303 @@
+﻿# ──────────────────────────────────────────────────────────────────────────────
+#  GYT — Production docker-compose
+#
+#  Public surface (via HAProxy):
+#    443  HTTPS  /graphql  /ws/*     → gateway
+#                /live/*             → live
+#                /*                  → frontend
+#    80   HTTP   → 301 to HTTPS
+#    23231 SSH   → soft-serve (git clone/push — exposed directly)
+#
+#  Everything else (postgres, redis, backend gRPC) is internal only.
+#
+#  Quick start:
+#    1. Copy .env.example → .env and fill in the values.
+#    2. Put your SSL certificate at haproxy/certs/gyt.pem
+#       (see haproxy/certs/README.txt or run scripts/gen-self-signed-cert.sh)
+#    3. docker compose up --build -d
+#
+#  Development (exposes individual service ports):
+#    docker compose -f docker-compose.yml -f docker-compose.override.yml up --build
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Reverse proxy — the ONLY service that binds to public host ports 80 / 443
+  # ───────────────────────────────────────────────────────────────────────────
+  haproxy:
+    build:
+      context: ./haproxy
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "23231:23231"  # SSH git clone — TCP passthrough to soft-serve
+      - "9418:9418"    # git daemon TCP passthrough to soft-serve
+    volumes:
+      - ./haproxy/certs:/usr/local/etc/haproxy/certs:ro
+    environment:
+      HAPROXY_STATS_PASSWORD: ${HAPROXY_STATS_PASSWORD}
+    depends_on:
+      frontend:
+        condition: service_started
+      gateway:
+        condition: service_healthy
+      live:
+        condition: service_healthy
+      soft-serve:
+        condition: service_healthy
+    networks:
+      - gyt
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Infrastructure
+  # ───────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER:     ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB:       ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - gyt
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks:
+      - gyt
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Git server  (soft-serve — all ports internal only in prod)
+  # SSH and git daemon are proxied through HAProxy (TCP mode).
+  # HTTP is proxied through HAProxy (HTTP mode, path *.git).
+  # ───────────────────────────────────────────────────────────────────────────
+  soft-serve:
+    build:
+      context: ./soft-serve
+      dockerfile: Dockerfile.build
+    restart: always
+    volumes:
+      - soft_serve_data:/soft-serve
+    networks:
+      - gyt
+    environment:
+      SOFT_SERVE_DATA_PATH:          /soft-serve
+      SOFT_SERVE_INITIAL_ADMIN_KEYS: ${SOFT_SERVE_INITIAL_ADMIN_KEYS:-}
+      SOFT_SERVE_GRPC_LISTEN_ADDR:   :23234
+      # Public clone URLs — returned to clients via the GetCloneURLs gRPC call.
+      # These must match what is reachable from the outside world (via HAProxy).
+      SOFT_SERVE_SSH_PUBLIC_URL:     ssh://${GIT_PUBLIC_HOST}:23231
+      SOFT_SERVE_HTTP_PUBLIC_URL:    ${PUBLIC_URL}
+      SOFT_SERVE_GIT_PUBLIC_URL:     git://${GIT_PUBLIC_HOST}
+      # GYT gateway endpoint — receives a POST /hooks/push on every git push.
+      # This triggers cache invalidation, PR stale-review dismissal, and WS events.
+      GYT_BACKEND_HOOK_URL:          http://gateway:8080
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:23232/livez || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Backend  (gRPC API — port 50051, internal only)
+  # ───────────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: backend-api/Dockerfile
+      args:
+        BUILD_TARGET: cmd
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      soft-serve:
+        condition: service_healthy
+    networks:
+      - gyt
+    environment:
+      DB_HOST:         postgres
+      DB_PORT:         "5432"
+      DB_USER:         ${DB_USER}
+      DB_PASSWORD:     ${DB_PASSWORD}
+      DB_NAME:         ${DB_NAME}
+      DB_SSLMODE:      disable
+      REDIS_ADDR:      redis:6379
+      REDIS_PASSWORD:  ${REDIS_PASSWORD}
+      GRPC_PORT:       "50051"
+      GIT_SERVER_ADDR: soft-serve:23234
+      JWT_SECRET:      ${JWT_SECRET}
+      ENV:             production
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # API Gateway  (GraphQL + WebSocket events — port 8080, internal only)
+  # ───────────────────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: backend-api/Dockerfile
+      args:
+        BUILD_TARGET: cmd/gateway
+    restart: always
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gyt
+    environment:
+      GRPC_BACKEND_ADDR: backend:50051
+      GATEWAY_PORT:      "8080"
+      JWT_SECRET:        ${JWT_SECRET}
+      ENV:               production
+      REDIS_ADDR:        redis:6379
+      REDIS_PASSWORD:    ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Live API  (WebSocket + SSE — port 8090, internal only)
+  # ───────────────────────────────────────────────────────────────────────────
+  live:
+    build:
+      context: .
+      dockerfile: backend-api/Dockerfile
+      args:
+        BUILD_TARGET: cmd/live
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - gyt
+    environment:
+      DB_HOST:           postgres
+      DB_PORT:           "5432"
+      DB_USER:           ${DB_USER}
+      DB_PASSWORD:       ${DB_PASSWORD}
+      DB_NAME:           ${DB_NAME}
+      REDIS_ADDR:        redis:6379
+      REDIS_PASSWORD:    ${REDIS_PASSWORD}
+      GRPC_BACKEND_ADDR: backend:50051
+      LIVE_PORT:         "8090"
+      JWT_SECRET:        ${JWT_SECRET}
+      CORS_ORIGIN:       ${PUBLIC_URL}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8090/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Frontend  (Next.js — port 3000, internal only)
+  # NEXT_PUBLIC_LIVE_API_URL is baked at build time; must equal PUBLIC_URL.
+  # ───────────────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./Gyt-Frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_LIVE_API_URL: ${PUBLIC_URL}
+        NEXT_PUBLIC_GRAPHQL_URL:  ${PUBLIC_URL}/graphql
+    restart: always
+    depends_on:
+      gateway:
+        condition: service_healthy
+      live:
+        condition: service_healthy
+    networks:
+      - gyt
+    environment:
+      NODE_ENV:                 production
+      NEXT_PUBLIC_GRAPHQL_URL:  ${PUBLIC_URL}/graphql
+      NEXT_PUBLIC_LIVE_API_URL: ${PUBLIC_URL}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  gyt:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  soft_serve_data:

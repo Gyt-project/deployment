@@ -1,0 +1,77 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  GYT — Development docker-compose override
+#
+#  Docker Compose automatically merges this file on top of docker-compose.yml.
+#
+#  Dev mirrors production: everything is routed through HAProxy on port 80
+#  (HTTP only — no certificate required locally).
+#
+#  Entry points:
+#    http://localhost        → frontend (Next.js)
+#    http://localhost/graphql → GraphQL API (gateway)
+#    http://localhost/live/*  → Live API (WebSocket / SSE)
+#
+#  Debug ports still exposed directly:
+#    localhost:5432   PostgreSQL
+#    localhost:6379   Redis
+#    localhost:50051  gRPC backend  (grpcurl)
+#    localhost:23231  soft-serve SSH
+#    localhost:23232  soft-serve HTTP / web UI
+#    localhost:23234  soft-serve gRPC management
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── HAProxy — HTTP only in dev (no TLS cert required) ────────────────────
+  haproxy:
+    ports:
+      - "80:80"
+      - "23231:23231"  # SSH git clone
+      - "9418:9418"    # git daemon
+    # Override the config template with the HTTP-only dev variant.
+    # The production template (haproxy.cfg.template) stays unchanged.
+    volumes:
+      - ./haproxy/haproxy.dev.cfg.template:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+
+  # ── Debug access to infrastructure ───────────────────────────────────────
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  soft-serve:
+    ports:
+      - "23232:23232"   # HTTP / web UI (direct debug access)
+      - "23233:23233"   # stats
+      - "23234:23234"   # gRPC management
+      # 23231 and 9418 are NOT exposed here — HAProxy owns those ports in dev too
+    environment:
+      SOFT_SERVE_SSH_PUBLIC_URL:  ssh://localhost:23231
+      SOFT_SERVE_HTTP_PUBLIC_URL: http://localhost
+      SOFT_SERVE_GIT_PUBLIC_URL:  git://localhost
+
+  backend:
+    ports:
+      - "50051:50051"   # gRPC — use grpcurl for ad-hoc calls
+
+  # ── Enable GraphQL Playground in dev ─────────────────────────────────────
+  gateway:
+    environment:
+      ENV: development
+
+  live:
+    environment:
+      CORS_ORIGIN: "http://localhost"
+
+  # ── Frontend build args point to HAProxy (port 80) ────────────────────────
+  frontend:
+    build:
+      args:
+        NEXT_PUBLIC_GRAPHQL_URL:  "http://localhost/graphql"
+        NEXT_PUBLIC_LIVE_API_URL: "http://localhost"
+    environment:
+      NEXT_PUBLIC_GRAPHQL_URL:  "http://localhost/graphql"
+      NEXT_PUBLIC_LIVE_API_URL: "http://localhost"

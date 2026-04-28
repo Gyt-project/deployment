@@ -1,0 +1,7 @@
+# Environment — never commit real credentials
+.env
+
+# SSL certificates — never commit private keys
+haproxy/certs/*.pem
+haproxy/certs/*.key
+haproxy/certs/*.crt

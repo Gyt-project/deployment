@@ -1,0 +1,103 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  GYT — HAProxy dev config (HTTP only, no SSL)
+#
+#  Port layout
+#  ───────────
+#    80    HTTP  → routed by path:
+#                   /graphql  /ws/*   → gateway   (GraphQL + WS events)
+#                   /live/*           → live       (WS / SSE live review)
+#                   /<user>/*.git     → soft-serve (git HTTP smart protocol)
+#                   /*                → frontend   (Next.js)
+#    23231 TCP   → soft-serve SSH    (git clone ssh://)
+#    9418  TCP   → soft-serve git daemon (git clone git://)
+# ──────────────────────────────────────────────────────────────────────────────
+
+global
+    log stdout format raw local0 info
+    maxconn 10000
+
+defaults
+    log    global
+    mode   http
+    option httplog
+    option dontlognull
+    option forwardfor
+    option http-server-close
+    timeout connect      5s
+    timeout client      60s
+    timeout server      60s
+    timeout tunnel    3600s
+    timeout http-request  15s
+    timeout http-keep-alive 15s
+
+# ─── Internal stats page ──────────────────────────────────────────────────────
+listen stats
+    bind *:8404
+    stats enable
+    stats uri  /stats
+    stats refresh 10s
+    stats auth admin:${HAPROXY_STATS_PASSWORD}
+    stats hide-version
+
+# ─── HTTP frontend ────────────────────────────────────────────────────────────
+frontend http_in
+    bind *:80
+
+    http-request set-header X-Forwarded-Proto http
+    http-request set-header X-Real-IP         %[src]
+
+    acl is_graphql  path_beg /graphql
+    acl is_ws       path_beg /ws
+    acl is_live     path_beg /live
+    acl is_git      path_end .git
+    acl is_git      path_reg \.git/
+
+    use_backend gateway_backend    if is_graphql
+    use_backend gateway_backend    if is_ws
+    use_backend live_backend       if is_live
+    use_backend soft_serve_backend if is_git
+    default_backend                frontend_backend
+
+# ─── Backends ─────────────────────────────────────────────────────────────────
+
+backend frontend_backend
+    option  httpchk GET /api/health
+    http-check expect status 200
+    server  frontend frontend:3000 check inter 10s fall 3 rise 2
+
+backend gateway_backend
+    option  httpchk GET /health
+    http-check expect status 200
+    server  gateway gateway:8080 check inter 10s fall 3 rise 2
+
+backend live_backend
+    option  httpchk GET /health
+    http-check expect status 200
+    server  live live:8090 check inter 10s fall 3 rise 2
+
+backend soft_serve_backend
+    option  httpchk GET /livez
+    http-check expect status 200
+    server  soft-serve soft-serve:23232 check inter 10s fall 3 rise 2
+
+# ─── SSH TCP passthrough (port 23231) ─────────────────────────────────────────
+frontend ssh_in
+    bind *:23231
+    mode tcp
+    option tcplog
+    default_backend soft_serve_ssh
+
+backend soft_serve_ssh
+    mode tcp
+    server soft-serve soft-serve:23231 check
+
+# ─── git daemon TCP passthrough (port 9418) ───────────────────────────────────
+frontend git_daemon_in
+    bind *:9418
+    mode tcp
+    option tcplog
+    default_backend soft_serve_git_daemon
+
+backend soft_serve_git_daemon
+    mode tcp
+    server soft-serve soft-serve:9418 check

@@ -1,0 +1,163 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  GYT — HAProxy reverse-proxy with SSL termination
+#
+#  Port layout (from the outside world)
+#  ─────────────────────────────────────
+#    80   HTTP  →  301 redirect to HTTPS (except /.well-known/acme-challenge/)
+#    443  HTTPS →  routed by path:
+#                    /graphql  /ws/*  → gateway  (GraphQL + realtime WS events)
+#                    /live/*          → live      (WS / SSE live review)
+#                    /*               → frontend  (Next.js)
+#
+#  SSL certificate
+#  ───────────────
+#  HAProxy expects a single PEM file that contains the certificate, any
+#  intermediate chain, and the private key — all concatenated together:
+#
+#    cat fullchain.pem privkey.pem > haproxy/certs/gyt.pem
+#
+#  For Let's Encrypt (Certbot):
+#    cat /etc/letsencrypt/live/<domain>/fullchain.pem \
+#        /etc/letsencrypt/live/<domain>/privkey.pem \
+#      > haproxy/certs/gyt.pem
+#
+#  For a self-signed cert (dev/staging):
+#    run `scripts/gen-self-signed-cert.sh`
+# ──────────────────────────────────────────────────────────────────────────────
+
+global
+    log stdout format raw local0 info
+    maxconn 50000
+    # TLS hardening — TLS 1.2 minimum, prefer AEAD ciphers
+    ssl-default-bind-options    ssl-min-ver TLSv1.2 no-tls-tickets
+    ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-ciphers    ECDH+AESGCM:ECDH+CHACHA20:ECDH+AES:!aNULL:!MD5:!DSS
+    ssl-default-server-options  ssl-min-ver TLSv1.2 no-tls-tickets
+    tune.ssl.default-dh-param   2048
+
+defaults
+    log    global
+    mode   http
+    option httplog
+    option dontlognull
+    option forwardfor
+    option http-server-close
+    # Standard timeouts
+    timeout connect      5s
+    timeout client      60s
+    timeout server      60s
+    # WebSocket / SSE connections stay open for up to an hour after the HTTP
+    # upgrade handshake completes.
+    timeout tunnel    3600s
+    timeout http-request  15s
+    timeout http-keep-alive 15s
+
+# ─── Internal stats page ──────────────────────────────────────────────────────
+# Reachable only from inside the Docker network (not exposed on the host).
+listen stats
+    bind *:8404
+    stats enable
+    stats uri  /stats
+    stats refresh 10s
+    stats auth admin:${HAPROXY_STATS_PASSWORD}
+    stats hide-version
+
+# ─── HTTP → HTTPS redirect ────────────────────────────────────────────────────
+frontend http_in
+    bind *:80
+
+    # Pass Let's Encrypt ACME challenges through without redirecting, so
+    # Certbot can renew certificates while the service is live.
+    acl is_acme  path_beg /.well-known/acme-challenge/
+    use_backend  acme_backend if is_acme
+
+    redirect scheme https code 301 if !is_acme
+
+# ─── HTTPS with SSL termination ───────────────────────────────────────────────
+frontend https_in
+    bind *:443 ssl crt /usr/local/etc/haproxy/certs/gyt.pem alpn h2,http/1.1
+
+    # ── Security response headers ─────────────────────────────────────────────
+    http-response set-header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+    http-response set-header X-Content-Type-Options    "nosniff"
+    http-response set-header X-Frame-Options           "SAMEORIGIN"
+    http-response set-header X-XSS-Protection          "1; mode=block"
+    http-response set-header Referrer-Policy           "strict-origin-when-cross-origin"
+
+    # Forward the real client IP and signal that the original request was HTTPS
+    # so backend services can build correct redirect URLs.
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Real-IP         %[src]
+
+    # ── Routing ACLs ─────────────────────────────────────────────────────────
+    # GraphQL endpoint + repo/PR WebSocket subscriptions (gateway)
+    acl is_graphql  path_beg /graphql
+    acl is_ws       path_beg /ws
+
+    # Live PR collaboration (WebSocket + SSE)
+    acl is_live     path_beg /live
+
+    # Git HTTP smart protocol — matches /<user>/<repo>.git and info/refs, etc.
+    acl is_git      path_end .git
+    acl is_git      path_reg \.git/
+
+    use_backend gateway_backend    if is_graphql
+    use_backend gateway_backend    if is_ws
+    use_backend live_backend       if is_live
+    use_backend soft_serve_backend if is_git
+    default_backend                frontend_backend
+
+# ─── Backends ─────────────────────────────────────────────────────────────────
+
+backend frontend_backend
+    option  httpchk GET /api/health
+    http-check expect status 200
+    server  frontend frontend:3000 check inter 10s fall 3 rise 2
+
+backend gateway_backend
+    option  httpchk GET /health
+    http-check expect status 200
+    # http-server-close must be off for WebSocket upgrades; HAProxy honours the
+    # Upgrade header and sets up a tunnel automatically, so normal HTTP requests
+    # and WebSocket connections coexist on the same backend.
+    server  gateway gateway:8080 check inter 10s fall 3 rise 2
+
+backend live_backend
+    option  httpchk GET /health
+    http-check expect status 200
+    server  live live:8090 check inter 10s fall 3 rise 2
+
+backend soft_serve_backend
+    option  httpchk GET /livez
+    http-check expect status 200
+    server  soft-serve soft-serve:23232 check inter 10s fall 3 rise 2
+
+# ─── SSH TCP passthrough (port 23231) ─────────────────────────────────────────
+# HAProxy cannot terminate SSH in http mode; TCP frontend passes it straight
+# through to soft-serve which handles the SSH handshake itself.
+frontend ssh_in
+    bind *:23231
+    mode tcp
+    option tcplog
+    default_backend soft_serve_ssh
+
+backend soft_serve_ssh
+    mode tcp
+    server soft-serve soft-serve:23231 check
+
+# ─── git daemon TCP passthrough (port 9418) ───────────────────────────────────
+frontend git_daemon_in
+    bind *:9418
+    mode tcp
+    option tcplog
+    default_backend soft_serve_git_daemon
+
+backend soft_serve_git_daemon
+    mode tcp
+    server soft-serve soft-serve:9418 check
+
+# ─── Let's Encrypt ACME challenge backend ─────────────────────────────────────
+# Certbot --standalone binds to port 8888 inside the container when renewing.
+# Mount the webroot or point here depending on your Certbot setup.
+backend acme_backend
+    server certbot 127.0.0.1:8888
